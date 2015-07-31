@@ -1,0 +1,194 @@
+From eb92851766830d09c49c6161071f0ab1a7485db2 Mon Sep 17 00:00:00 2001
+From: Yiannis Yiakoumis <yiannisy@stanford.edu>
+Date: Fri, 31 Jul 2015 11:54:02 -0700
+Subject: [PATCH] Add support for network cookie extension.
+
+Add a custom extension for network cookies. Users can add the extension
+using the SSL_set_tls_network_cookie API call.
+It only adds the necessary code to add the cookie in ClientHello handshake
+messages.
+
+TODO(yiannisy): add code for parsing and server support.
+
+TEST=manually in Chrome
+BUG=none
+---
+ include/openssl/ssl.h  |    7 +++++++
+ include/openssl/tls1.h |    8 ++++++++
+ ssl/s3_lib.c           |   20 ++++++++++++++++++++
+ ssl/t1_lib.c           |   43 +++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 78 insertions(+)
+
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index 1338b4e..8cdb8be 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -975,6 +975,8 @@ struct ssl_session_st {
+   size_t tlsext_signed_cert_timestamp_list_length;
+   uint8_t *tlsext_signed_cert_timestamp_list; /* Server's list. */
+ 
++  char *tlsext_network_cookie;
++
+   /* The OCSP response that came with the session. */
+   size_t ocsp_response_length;
+   uint8_t *ocsp_response;
+@@ -1709,6 +1711,8 @@ struct ssl_st {
+   size_t tlsext_ellipticcurvelist_length;
+   uint16_t *tlsext_ellipticcurvelist; /* our list */
+ 
++  char *tlsext_network_cookie;
++
+   SSL_CTX *initial_ctx; /* initial ctx, used to store sessions */
+ 
+   /* Next protocol negotiation. For the client, this is the protocol that we
+@@ -2671,6 +2675,7 @@ OPENSSL_EXPORT const char *SSLeay_version(int unused);
+ #define SSL_CTRL_SET_SESS_CACHE_MODE doesnt_exist
+ #define SSL_CTRL_SET_SESS_CACHE_SIZE doesnt_exist
+ #define SSL_CTRL_SET_TLSEXT_HOSTNAME doesnt_exist
++#define SSL_CTRL_SET_TLSEXT_NETWORKCOOKIE doesnt_exist
+ #define SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG doesnt_exist
+ #define SSL_CTRL_SET_TLSEXT_SERVERNAME_CB doesnt_exist
+ #define SSL_CTRL_SET_TLSEXT_TICKET_KEYS doesnt_exist
+@@ -2748,6 +2753,7 @@ OPENSSL_EXPORT const char *SSLeay_version(int unused);
+ #define SSL_set_mtu SSL_set_mtu
+ #define SSL_set_options SSL_set_options
+ #define SSL_set_tlsext_host_name SSL_set_tlsext_host_name
++#define SSL_set_tlsext_network_cookie SSL_set_tlsext_network_cookie
+ #define SSL_set_tmp_dh SSL_set_tmp_dh
+ #define SSL_set_tmp_ecdh SSL_set_tmp_ecdh
+ #define SSL_set_tmp_rsa SSL_set_tmp_rsa
+@@ -2986,5 +2992,6 @@ OPENSSL_EXPORT const char *SSLeay_version(int unused);
+ #define SSL_R_TLSV1_UNRECOGNIZED_NAME 1112
+ #define SSL_R_TLSV1_BAD_CERTIFICATE_STATUS_RESPONSE 1113
+ #define SSL_R_TLSV1_BAD_CERTIFICATE_HASH_VALUE 1114
++#define SSL_R_SSL3_EXT_INVALID_NETWORK_COOKIE 1115
+ 
+ #endif /* OPENSSL_HEADER_SSL_H */
+diff --git a/include/openssl/tls1.h b/include/openssl/tls1.h
+index ad8c130..a12f444 100644
+--- a/include/openssl/tls1.h
++++ b/include/openssl/tls1.h
+@@ -242,6 +242,9 @@ extern "C" {
+ #define TLSEXT_TYPE_channel_id 30031
+ #define TLSEXT_TYPE_channel_id_new 30032
+ 
++/* This is not an IANA defined extension number */
++#define TLSEXT_TYPE_network_cookie 50001
++
+ /* NameType value from RFC 3546 */
+ #define TLSEXT_NAMETYPE_host_name 0
+ /* status request value from RFC 3546 */
+@@ -277,6 +280,7 @@ extern "C" {
+ 
+ 
+ #define TLSEXT_MAXLEN_host_name 255
++#define TLSEXT_MAXLEN_network_cookie 1023
+ 
+ OPENSSL_EXPORT const char *SSL_get_servername(const SSL *s, const int type);
+ OPENSSL_EXPORT int SSL_get_servername_type(const SSL *s);
+@@ -295,6 +299,10 @@ OPENSSL_EXPORT int SSL_export_keying_material(
+  * in the server_name extension. It returns one on success and zero on error. */
+ OPENSSL_EXPORT int SSL_set_tlsext_host_name(SSL *ssl, const char *name);
+ 
++/* SSL_set_tlsext_network_cookie, for a client, configures |ssl| to advertise |cookie|
++ * in the network cookie extension. It returns one on success and zero on error. */
++OPENSSL_EXPORT int SSL_set_tlsext_network_cookie(SSL *ssl, const char *cookie);
++
+ /* SSL_CTX_set_tlsext_servername_callback configures |callback| to be called on
+  * the server after ClientHello extensions have been parsed and returns one.
+  * |callback| may use |SSL_get_servername| to examine the server_name extension
+diff --git a/ssl/s3_lib.c b/ssl/s3_lib.c
+index f9041e0..e440757 100644
+--- a/ssl/s3_lib.c
++++ b/ssl/s3_lib.c
+@@ -369,6 +369,26 @@ int SSL_set_tlsext_host_name(SSL *ssl, const char *name) {
+   return 1;
+ }
+ 
++int SSL_set_tlsext_network_cookie(SSL *ssl, const char *cookie) {
++  OPENSSL_free(ssl->tlsext_network_cookie);
++  ssl->tlsext_network_cookie = NULL;
++
++  if (cookie == NULL) {
++    return 1;
++  }
++  if (strlen(cookie) > TLSEXT_MAXLEN_network_cookie) {
++    OPENSSL_PUT_ERROR(SSL, SSL_R_SSL3_EXT_INVALID_NETWORK_COOKIE);
++    return 0;
++  }
++  ssl->tlsext_network_cookie = BUF_strdup(cookie);
++  if (ssl->tlsext_network_cookie == NULL) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_MALLOC_FAILURE);
++    return 0;
++  }
++  return 1;
++}
++
++
+ long ssl3_ctrl(SSL *s, int cmd, long larg, void *parg) {
+   int ret = 0;
+ 
+diff --git a/ssl/t1_lib.c b/ssl/t1_lib.c
+index 3e4cc29..b4ed18d 100644
+--- a/ssl/t1_lib.c
++++ b/ssl/t1_lib.c
+@@ -972,6 +972,41 @@ static int ext_sni_add_serverhello(SSL *ssl, CBB *out) {
+   return 1;
+ }
+ 
++/* Network Cookies.
++ *
++ * http://anylink.stanford.edu */
++
++static void ext_network_cookie_init(SSL *ssl) {
++}
++
++static int ext_network_cookie_add_clienthello(SSL *ssl, CBB *out) {
++  if (ssl->tlsext_network_cookie == NULL) {
++    return 1;
++  }
++
++  CBB contents, network_cookie;
++  if (!CBB_add_u16(out, TLSEXT_TYPE_network_cookie) ||
++      !CBB_add_u16_length_prefixed(out, &contents) ||
++      !CBB_add_bytes(&contents, (const uint8_t *)ssl->tlsext_network_cookie,
++		     strlen(ssl->tlsext_network_cookie)) ||
++      !CBB_flush(out)) {
++    return 0;
++  }
++
++  return 1;
++}
++
++static int ext_network_cookie_parse_serverhello(SSL *ssl, uint8_t *out_alert, CBS *contents) {
++  return 1;
++}
++
++static int ext_network_cookie_parse_clienthello(SSL *ssl, uint8_t *out_alert, CBS *contents) {
++  return 1;
++}
++
++static int ext_network_cookie_add_serverhello(SSL *ssl, CBB *out) {
++  return 1;
++}
+ 
+ /* Renegotiation indication.
+  *
+@@ -1531,6 +1566,14 @@ static const struct tls_extension kExtensions[] = {
+     ext_sni_add_serverhello,
+   },
+   {
++    TLSEXT_TYPE_network_cookie,
++    ext_network_cookie_init,
++    ext_network_cookie_add_clienthello,
++    ext_network_cookie_parse_serverhello,
++    ext_network_cookie_parse_clienthello,
++    ext_network_cookie_add_serverhello,
++  },
++  {
+     TLSEXT_TYPE_extended_master_secret,
+     ext_ems_init,
+     ext_ems_add_clienthello,
+-- 
+1.7.9.5
+

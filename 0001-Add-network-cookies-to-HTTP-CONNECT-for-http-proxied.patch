@@ -1,0 +1,288 @@
+From 48c8fa02f4674c4a3319908815449e485d34aa6f Mon Sep 17 00:00:00 2001
+From: Yiannis Yiakoumis <yiannisy@stanford.edu>
+Date: Thu, 30 Jul 2015 17:55:33 -0700
+Subject: [PATCH 1/2] Add network cookies to HTTP CONNECT for http-proxied
+ https requests.
+
+Network cookies are set as HTTP headers. For proxied HTTPS, we issue
+an HTTP CONNECT to the proxy, but network-cookie remains in the original
+request. We copy the header to HTTP connect so that the proxy can also detect
+the cookie.
+
+TODO(yiannisy): some CONNECT requests seem to come out without the cookie
+		header attached. They might skip the extension alltogether,
+		or follow a different path (e.g. due to prefetching) which
+		doesn't copy the header properly. Need to better understand
+		this.
+
+TEST=manually in Linux.
+BUG=none
+---
+ net/http/http_proxy_client_socket.cc      |   13 +++++++++++-
+ net/http/http_proxy_client_socket.h       |    1 +
+ net/http/http_proxy_client_socket_pool.cc |   32 +++++++++++++++++++++++++++++
+ net/http/http_proxy_client_socket_pool.h  |   15 ++++++++++++++
+ net/http/http_request_headers.cc          |    1 +
+ net/http/http_request_headers.h           |    1 +
+ net/http/proxy_client_socket.cc           |   30 +++++++++++++++++++++++++++
+ net/http/proxy_client_socket.h            |    7 +++++++
+ net/socket/client_socket_pool_manager.cc  |    5 +++++
+ 9 files changed, 104 insertions(+), 1 deletion(-)
+
+diff --git a/net/http/http_proxy_client_socket.cc b/net/http/http_proxy_client_socket.cc
+index f5feb58..b18c3a9 100644
+--- a/net/http/http_proxy_client_socket.cc
++++ b/net/http/http_proxy_client_socket.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "base/bind.h"
+ #include "base/bind_helpers.h"
++#include "base/logging.h"
+ #include "base/profiler/scoped_tracker.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/stringprintf.h"
+@@ -30,6 +31,7 @@ namespace net {
+ HttpProxyClientSocket::HttpProxyClientSocket(
+     ClientSocketHandle* transport_socket,
+     const std::string& user_agent,
++    const std::string& network_cookie,
+     const HostPortPair& endpoint,
+     const HostPortPair& proxy_server,
+     HttpAuthCache* http_auth_cache,
+@@ -65,6 +67,9 @@ HttpProxyClientSocket::HttpProxyClientSocket(
+   if (!user_agent.empty())
+     request_.extra_headers.SetHeader(HttpRequestHeaders::kUserAgent,
+                                      user_agent);
++  if (!network_cookie.empty())
++    request_.extra_headers.SetHeader(HttpRequestHeaders::kNetworkCookie,
++				     network_cookie);
+ }
+ 
+ HttpProxyClientSocket::~HttpProxyClientSocket() {
+@@ -423,7 +428,13 @@ int HttpProxyClientSocket::DoSendRequest() {
+                                           &user_agent)) {
+       user_agent.clear();
+     }
+-    BuildTunnelRequest(endpoint_, authorization_headers, user_agent,
++    std::string network_cookie;
++    if (!request_.extra_headers.GetHeader(HttpRequestHeaders::kNetworkCookie,
++					  &network_cookie)) {
++      network_cookie.clear();
++    }
++
++    BuildTunnelRequest(endpoint_, authorization_headers, user_agent, network_cookie,
+                        &request_line_, &request_headers_);
+ 
+     net_log_.AddEvent(
+diff --git a/net/http/http_proxy_client_socket.h b/net/http/http_proxy_client_socket.h
+index 439278a..c8d20f7 100644
+--- a/net/http/http_proxy_client_socket.h
++++ b/net/http/http_proxy_client_socket.h
+@@ -38,6 +38,7 @@ class HttpProxyClientSocket : public ProxyClientSocket {
+   // this socket will establish an Http tunnel.
+   HttpProxyClientSocket(ClientSocketHandle* transport_socket,
+                         const std::string& user_agent,
++			const std::string& network_cookie,
+                         const HostPortPair& endpoint,
+                         const HostPortPair& proxy_server,
+                         HttpAuthCache* http_auth_cache,
+diff --git a/net/http/http_proxy_client_socket_pool.cc b/net/http/http_proxy_client_socket_pool.cc
+index 1a60c6a..4b9fcb8 100644
+--- a/net/http/http_proxy_client_socket_pool.cc
++++ b/net/http/http_proxy_client_socket_pool.cc
+@@ -57,6 +57,37 @@ HttpProxySocketParams::HttpProxySocketParams(
+   }
+ }
+ 
++HttpProxySocketParams::HttpProxySocketParams(
++    const scoped_refptr<TransportSocketParams>& transport_params,
++    const scoped_refptr<SSLSocketParams>& ssl_params,
++    const std::string& user_agent,
++    const std::string& network_cookie,
++    const HostPortPair& endpoint,
++    HttpAuthCache* http_auth_cache,
++    HttpAuthHandlerFactory* http_auth_handler_factory,
++    SpdySessionPool* spdy_session_pool,
++    bool tunnel,
++    ProxyDelegate* proxy_delegate)
++    : transport_params_(transport_params),
++      ssl_params_(ssl_params),
++      spdy_session_pool_(spdy_session_pool),
++      user_agent_(user_agent),
++      network_cookie_(network_cookie),
++      endpoint_(endpoint),
++      http_auth_cache_(tunnel ? http_auth_cache : NULL),
++      http_auth_handler_factory_(tunnel ? http_auth_handler_factory : NULL),
++      tunnel_(tunnel),
++      proxy_delegate_(proxy_delegate) {
++  DCHECK((transport_params.get() == NULL && ssl_params.get() != NULL) ||
++         (transport_params.get() != NULL && ssl_params.get() == NULL));
++  if (transport_params_.get()) {
++    ignore_limits_ = transport_params->ignore_limits();
++  } else {
++    ignore_limits_ = ssl_params->ignore_limits();
++  }
++}
++
++
+ const HostResolver::RequestInfo& HttpProxySocketParams::destination() const {
+   if (transport_params_.get() == NULL) {
+     return ssl_params_->GetDirectConnectionParams()->destination();
+@@ -285,6 +316,7 @@ int HttpProxyConnectJob::DoHttpProxyConnect() {
+   transport_socket_.reset(
+       new HttpProxyClientSocket(transport_socket_handle_.release(),
+                                 params_->user_agent(),
++				params_->network_cookie(),
+                                 params_->endpoint(),
+                                 proxy_server,
+                                 params_->http_auth_cache(),
+diff --git a/net/http/http_proxy_client_socket_pool.h b/net/http/http_proxy_client_socket_pool.h
+index 1440fc7..187789c 100644
+--- a/net/http/http_proxy_client_socket_pool.h
++++ b/net/http/http_proxy_client_socket_pool.h
+@@ -52,6 +52,19 @@ class NET_EXPORT_PRIVATE HttpProxySocketParams
+       bool tunnel,
+       ProxyDelegate* proxy_delegate);
+ 
++  HttpProxySocketParams(
++      const scoped_refptr<TransportSocketParams>& transport_params,
++      const scoped_refptr<SSLSocketParams>& ssl_params,
++      const std::string& user_agent,
++      const std::string& network_cookie,
++      const HostPortPair& endpoint,
++      HttpAuthCache* http_auth_cache,
++      HttpAuthHandlerFactory* http_auth_handler_factory,
++      SpdySessionPool* spdy_session_pool,
++      bool tunnel,
++      ProxyDelegate* proxy_delegate);
++
++
+   const scoped_refptr<TransportSocketParams>& transport_params() const {
+     return transport_params_;
+   }
+@@ -59,6 +72,7 @@ class NET_EXPORT_PRIVATE HttpProxySocketParams
+     return ssl_params_;
+   }
+   const std::string& user_agent() const { return user_agent_; }
++  const std::string& network_cookie() const { return network_cookie_; }
+   const HostPortPair& endpoint() const { return endpoint_; }
+   HttpAuthCache* http_auth_cache() const { return http_auth_cache_; }
+   HttpAuthHandlerFactory* http_auth_handler_factory() const {
+@@ -83,6 +97,7 @@ class NET_EXPORT_PRIVATE HttpProxySocketParams
+   const scoped_refptr<SSLSocketParams> ssl_params_;
+   SpdySessionPool* spdy_session_pool_;
+   const std::string user_agent_;
++  const std::string network_cookie_;
+   const HostPortPair endpoint_;
+   HttpAuthCache* const http_auth_cache_;
+   HttpAuthHandlerFactory* const http_auth_handler_factory_;
+diff --git a/net/http/http_request_headers.cc b/net/http/http_request_headers.cc
+index c2eee59..dcda7ed 100644
+--- a/net/http/http_request_headers.cc
++++ b/net/http/http_request_headers.cc
+@@ -28,6 +28,7 @@ const char HttpRequestHeaders::kHost[] = "Host";
+ const char HttpRequestHeaders::kIfModifiedSince[] = "If-Modified-Since";
+ const char HttpRequestHeaders::kIfNoneMatch[] = "If-None-Match";
+ const char HttpRequestHeaders::kIfRange[] = "If-Range";
++const char HttpRequestHeaders::kNetworkCookie[] = "Network-Cookie";
+ const char HttpRequestHeaders::kOrigin[] = "Origin";
+ const char HttpRequestHeaders::kPragma[] = "Pragma";
+ const char HttpRequestHeaders::kProxyAuthorization[] = "Proxy-Authorization";
+diff --git a/net/http/http_request_headers.h b/net/http/http_request_headers.h
+index e6f25ed..708d7bc 100644
+--- a/net/http/http_request_headers.h
++++ b/net/http/http_request_headers.h
+@@ -70,6 +70,7 @@ class NET_EXPORT HttpRequestHeaders {
+   static const char kIfModifiedSince[];
+   static const char kIfNoneMatch[];
+   static const char kIfRange[];
++  static const char kNetworkCookie[];
+   static const char kOrigin[];
+   static const char kPragma[];
+   static const char kProxyAuthorization[];
+diff --git a/net/http/proxy_client_socket.cc b/net/http/proxy_client_socket.cc
+index 3094b43..125941a 100644
+--- a/net/http/proxy_client_socket.cc
++++ b/net/http/proxy_client_socket.cc
+@@ -57,6 +57,36 @@ void ProxyClientSocket::BuildTunnelRequest(
+ }
+ 
+ // static
++void ProxyClientSocket::BuildTunnelRequest(
++    const HostPortPair& endpoint,
++    const HttpRequestHeaders& auth_headers,
++    const std::string& user_agent,
++    const std::string& network_cookie,
++    std::string* request_line,
++    HttpRequestHeaders* request_headers) {
++  // RFC 7230 Section 5.4 says a client MUST send a Host header field in all
++  // HTTP/1.1 request messages, and Host SHOULD be the first header field
++  // following the request-line.  Add "Proxy-Connection: keep-alive" for compat
++  // with HTTP/1.0 proxies such as Squid (required for NTLM authentication).
++  std::string host_and_port = endpoint.ToString();
++  *request_line =
++      base::StringPrintf("CONNECT %s HTTP/1.1\r\n", host_and_port.c_str());
++  request_headers->SetHeader(HttpRequestHeaders::kHost, endpoint.port() == 443
++                                                            ? endpoint.host()
++                                                            : host_and_port);
++  request_headers->SetHeader(HttpRequestHeaders::kProxyConnection,
++                             "keep-alive");
++  if (!user_agent.empty())
++    request_headers->SetHeader(HttpRequestHeaders::kUserAgent, user_agent);
++
++  if (!network_cookie.empty())
++    request_headers->SetHeader(HttpRequestHeaders::kNetworkCookie, network_cookie);
++
++  request_headers->MergeFrom(auth_headers);
++}
++
++
++// static
+ int ProxyClientSocket::HandleProxyAuthChallenge(HttpAuthController* auth,
+                                                 HttpResponseInfo* response,
+                                                 const BoundNetLog& net_log) {
+diff --git a/net/http/proxy_client_socket.h b/net/http/proxy_client_socket.h
+index 2d6688f..e3f08cf 100644
+--- a/net/http/proxy_client_socket.h
++++ b/net/http/proxy_client_socket.h
+@@ -59,7 +59,14 @@ class NET_EXPORT_PRIVATE ProxyClientSocket : public StreamSocket {
+   // and 5.3.
+   static void BuildTunnelRequest(const HostPortPair& endpoint,
+                                  const HttpRequestHeaders& auth_headers,
++				 const std::string& user_agent,
++                                 std::string* request_line,
++                                 HttpRequestHeaders* request_headers);
++
++  static void BuildTunnelRequest(const HostPortPair& endpoint,
++                                 const HttpRequestHeaders& auth_headers,
+                                  const std::string& user_agent,
++				 const std::string& network_cookie,
+                                  std::string* request_line,
+                                  HttpRequestHeaders* request_headers);
+ 
+diff --git a/net/socket/client_socket_pool_manager.cc b/net/socket/client_socket_pool_manager.cc
+index 7820cf9..2f2cccc 100644
+--- a/net/socket/client_socket_pool_manager.cc
++++ b/net/socket/client_socket_pool_manager.cc
+@@ -167,6 +167,10 @@ int InitSocketPoolHelper(ClientSocketPoolManager::SocketGroupType group_type,
+       std::string user_agent;
+       request_extra_headers.GetHeader(HttpRequestHeaders::kUserAgent,
+                                       &user_agent);
++      std::string network_cookie;
++      request_extra_headers.GetHeader(HttpRequestHeaders::kNetworkCookie,
++				      &network_cookie);
++
+       scoped_refptr<SSLSocketParams> ssl_params;
+       if (proxy_info.is_https()) {
+         // Combine connect and write for SSL sockets in TCP FastOpen
+@@ -193,6 +197,7 @@ int InitSocketPoolHelper(ClientSocketPoolManager::SocketGroupType group_type,
+           new HttpProxySocketParams(proxy_tcp_params,
+                                     ssl_params,
+                                     user_agent,
++				    network_cookie,
+                                     origin_host_port,
+                                     session->http_auth_cache(),
+                                     session->http_auth_handler_factory(),
+-- 
+1.7.9.5
+

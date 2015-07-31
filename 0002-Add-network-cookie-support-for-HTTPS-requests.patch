@@ -1,0 +1,292 @@
+From e60b09cbe2d3b8612cece5c572d054413871e721 Mon Sep 17 00:00:00 2001
+From: Yiannis Yiakoumis <yiannisy@stanford.edu>
+Date: Fri, 31 Jul 2015 11:57:36 -0700
+Subject: [PATCH 2/2] Add network cookie support for HTTPS requests.
+
+Network cookies are originally expressed as HTTP headers. An intermediary
+doesn't have info to these fields, so we reflect cookies as a custom
+TLS extension. This patch detects the network cookie header, and adds
+the relevant extension when connecting the corresponding SSL socket.
+Following-up, BoringSSL will detect that and add it to the ClientHello
+handshake message.
+---
+ net/socket/client_socket_factory.cc      |   38 ++++++++++++++++++++++++++
+ net/socket/client_socket_factory.h       |    7 +++++
+ net/socket/client_socket_pool_manager.cc |    5 +++-
+ net/socket/ssl_client_socket_openssl.cc  |   44 ++++++++++++++++++++++++++++++
+ net/socket/ssl_client_socket_openssl.h   |    7 +++++
+ net/socket/ssl_client_socket_pool.cc     |   35 ++++++++++++++++++++++++
+ net/socket/ssl_client_socket_pool.h      |   12 ++++++++
+ 7 files changed, 147 insertions(+), 1 deletion(-)
+
+diff --git a/net/socket/client_socket_factory.cc b/net/socket/client_socket_factory.cc
+index cb5d851..70d0388 100644
+--- a/net/socket/client_socket_factory.cc
++++ b/net/socket/client_socket_factory.cc
+@@ -120,6 +120,44 @@ class DefaultClientSocketFactory : public ClientSocketFactory,
+ #endif
+   }
+ 
++  scoped_ptr<SSLClientSocket> CreateSSLClientSocket(
++      scoped_ptr<ClientSocketHandle> transport_socket,
++      const HostPortPair& host_and_port,
++      const std::string& network_cookie,
++      const SSLConfig& ssl_config,
++      const SSLClientSocketContext& context) override {
++    // nss_thread_task_runner_ may be NULL if g_use_dedicated_nss_thread is
++    // false or if the dedicated NSS thread failed to start. If so, cause NSS
++    // functions to execute on the current task runner.
++    //
++    // Note: The current task runner is obtained on each call due to unit
++    // tests, which may create and tear down the current thread's TaskRunner
++    // between each test. Because the DefaultClientSocketFactory is leaky, it
++    // may span multiple tests, and thus the current task runner may change
++    // from call to call.
++    scoped_refptr<base::SequencedTaskRunner> nss_task_runner(
++        nss_thread_task_runner_);
++    if (!nss_task_runner.get())
++      nss_task_runner = base::ThreadTaskRunnerHandle::Get();
++
++#if defined(USE_OPENSSL)
++    return scoped_ptr<SSLClientSocket>(
++        new SSLClientSocketOpenSSL(transport_socket.Pass(), host_and_port,
++                                   network_cookie, ssl_config, context));
++#elif defined(USE_NSS_CERTS) || defined(OS_MACOSX) || defined(OS_WIN)
++    return scoped_ptr<SSLClientSocket>(
++        new SSLClientSocketNSS(nss_task_runner.get(),
++                               transport_socket.Pass(),
++                               host_and_port,
++                               ssl_config,
++                               context));
++#else
++    NOTIMPLEMENTED();
++    return scoped_ptr<SSLClientSocket>();
++#endif
++  }
++
++
+   void ClearSSLSessionCache() override { SSLClientSocket::ClearSessionCache(); }
+ 
+  private:
+diff --git a/net/socket/client_socket_factory.h b/net/socket/client_socket_factory.h
+index a1ad503..edf0363 100644
+--- a/net/socket/client_socket_factory.h
++++ b/net/socket/client_socket_factory.h
+@@ -53,6 +53,13 @@ class NET_EXPORT ClientSocketFactory {
+       const SSLConfig& ssl_config,
+       const SSLClientSocketContext& context) = 0;
+ 
++  virtual scoped_ptr<SSLClientSocket> CreateSSLClientSocket(
++      scoped_ptr<ClientSocketHandle> transport_socket,
++      const HostPortPair& host_and_port,
++      const std::string& network_cookie,
++      const SSLConfig& ssl_config,
++      const SSLClientSocketContext& context) = 0;
++
+   // Clears cache used for SSL session resumption.
+   virtual void ClearSSLSessionCache() = 0;
+ 
+diff --git a/net/socket/client_socket_pool_manager.cc b/net/socket/client_socket_pool_manager.cc
+index 2f2cccc..0922de3 100644
+--- a/net/socket/client_socket_pool_manager.cc
++++ b/net/socket/client_socket_pool_manager.cc
+@@ -241,9 +241,12 @@ int InitSocketPoolHelper(ClientSocketPoolManager::SocketGroupType group_type,
+                                                  resolution_callback,
+                                                  combine_connect_and_write);
+     }
++    std::string network_cookie;
++    request_extra_headers.GetHeader(HttpRequestHeaders::kNetworkCookie,
++				    &network_cookie);
+     scoped_refptr<SSLSocketParams> ssl_params = new SSLSocketParams(
+         ssl_tcp_params, socks_params, http_proxy_params, origin_host_port,
+-        ssl_config_for_origin, privacy_mode, load_flags, expect_spdy);
++        network_cookie, ssl_config_for_origin, privacy_mode, load_flags, expect_spdy);
+     SSLClientSocketPool* ssl_pool = NULL;
+     if (proxy_info.is_direct()) {
+       ssl_pool = session->GetSSLSocketPool(socket_pool_type);
+diff --git a/net/socket/ssl_client_socket_openssl.cc b/net/socket/ssl_client_socket_openssl.cc
+index 7b3b557..5b1657d 100644
+--- a/net/socket/ssl_client_socket_openssl.cc
++++ b/net/socket/ssl_client_socket_openssl.cc
+@@ -480,6 +480,46 @@ SSLClientSocketOpenSSL::SSLClientSocketOpenSSL(
+   DCHECK(cert_verifier_);
+ }
+ 
++SSLClientSocketOpenSSL::SSLClientSocketOpenSSL(
++    scoped_ptr<ClientSocketHandle> transport_socket,
++    const HostPortPair& host_and_port,
++    const std::string& network_cookie,
++    const SSLConfig& ssl_config,
++    const SSLClientSocketContext& context)
++    : transport_send_busy_(false),
++      transport_recv_busy_(false),
++      pending_read_error_(kNoPendingResult),
++      pending_read_ssl_error_(SSL_ERROR_NONE),
++      transport_read_error_(OK),
++      transport_write_error_(OK),
++      server_cert_chain_(new PeerCertificateChain(NULL)),
++      completed_connect_(false),
++      was_ever_used_(false),
++      cert_verifier_(context.cert_verifier),
++      cert_transparency_verifier_(context.cert_transparency_verifier),
++      channel_id_service_(context.channel_id_service),
++      ssl_(NULL),
++      transport_bio_(NULL),
++      transport_(transport_socket.Pass()),
++      host_and_port_(host_and_port),
++      ssl_config_(ssl_config),
++      ssl_session_cache_shard_(context.ssl_session_cache_shard),
++      network_cookie_(network_cookie),
++      next_handshake_state_(STATE_NONE),
++      npn_status_(kNextProtoUnsupported),
++      channel_id_sent_(false),
++      session_pending_(false),
++      certificate_verified_(false),
++      ssl_failure_state_(SSL_FAILURE_NONE),
++      signature_result_(kNoPendingResult),
++      transport_security_state_(context.transport_security_state),
++      policy_enforcer_(context.cert_policy_enforcer),
++      net_log_(transport_->socket()->NetLog()),
++      weak_factory_(this) {
++  DCHECK(cert_verifier_);
++}
++
++
+ SSLClientSocketOpenSSL::~SSLClientSocketOpenSSL() {
+   Disconnect();
+ }
+@@ -813,6 +853,10 @@ int SSLClientSocketOpenSSL::Init() {
+     return ERR_UNEXPECTED;
+   }
+ 
++  if (!SSL_set_tlsext_network_cookie(ssl_, network_cookie_.c_str())) {
++    return ERR_UNEXPECTED;
++  }
++
+   SSL_SESSION* session = context->session_cache()->Lookup(GetSessionCacheKey());
+   if (session != nullptr)
+     SSL_set_session(ssl_, session);
+diff --git a/net/socket/ssl_client_socket_openssl.h b/net/socket/ssl_client_socket_openssl.h
+index 645aaf4..a3f4ebb 100644
+--- a/net/socket/ssl_client_socket_openssl.h
++++ b/net/socket/ssl_client_socket_openssl.h
+@@ -46,12 +46,18 @@ class SSLClientSocketOpenSSL : public SSLClientSocket {
+                          const HostPortPair& host_and_port,
+                          const SSLConfig& ssl_config,
+                          const SSLClientSocketContext& context);
++  SSLClientSocketOpenSSL(scoped_ptr<ClientSocketHandle> transport_socket,
++                         const HostPortPair& host_and_port,
++			 const std::string& network_cookie,
++                         const SSLConfig& ssl_config,
++                         const SSLClientSocketContext& context);
+   ~SSLClientSocketOpenSSL() override;
+ 
+   const HostPortPair& host_and_port() const { return host_and_port_; }
+   const std::string& ssl_session_cache_shard() const {
+     return ssl_session_cache_shard_;
+   }
++  const std::string& network_cookie() const { return network_cookie_; }
+ 
+   // SSLClientSocket implementation.
+   void GetSSLCertRequestInfo(SSLCertRequestInfo* cert_request_info) override;
+@@ -289,6 +295,7 @@ class SSLClientSocketOpenSSL : public SSLClientSocket {
+   // session cache. i.e. sessions created with one value will not attempt to
+   // resume on the socket with a different value.
+   const std::string ssl_session_cache_shard_;
++  const std::string network_cookie_;
+ 
+   enum State {
+     STATE_NONE,
+diff --git a/net/socket/ssl_client_socket_pool.cc b/net/socket/ssl_client_socket_pool.cc
+index a80df57..53dfcde 100644
+--- a/net/socket/ssl_client_socket_pool.cc
++++ b/net/socket/ssl_client_socket_pool.cc
+@@ -57,6 +57,40 @@ SSLSocketParams::SSLSocketParams(
+   }
+ }
+ 
++SSLSocketParams::SSLSocketParams(
++    const scoped_refptr<TransportSocketParams>& direct_params,
++    const scoped_refptr<SOCKSSocketParams>& socks_proxy_params,
++    const scoped_refptr<HttpProxySocketParams>& http_proxy_params,
++    const HostPortPair& host_and_port,
++    const std::string& network_cookie,
++    const SSLConfig& ssl_config,
++    PrivacyMode privacy_mode,
++    int load_flags,
++    bool expect_spdy)
++    : direct_params_(direct_params),
++      socks_proxy_params_(socks_proxy_params),
++      http_proxy_params_(http_proxy_params),
++      host_and_port_(host_and_port),
++      network_cookie_(network_cookie),
++      ssl_config_(ssl_config),
++      privacy_mode_(privacy_mode),
++      load_flags_(load_flags),
++      expect_spdy_(expect_spdy),
++      ignore_limits_(false) {
++  if (direct_params_.get()) {
++    DCHECK(!socks_proxy_params_.get());
++    DCHECK(!http_proxy_params_.get());
++    ignore_limits_ = direct_params_->ignore_limits();
++  } else if (socks_proxy_params_.get()) {
++    DCHECK(!http_proxy_params_.get());
++    ignore_limits_ = socks_proxy_params_->ignore_limits();
++  } else {
++    DCHECK(http_proxy_params_.get());
++    ignore_limits_ = http_proxy_params_->ignore_limits();
++  }
++}
++
++
+ SSLSocketParams::~SSLSocketParams() {}
+ 
+ SSLSocketParams::ConnectionType SSLSocketParams::GetConnectionType() const {
+@@ -320,6 +354,7 @@ int SSLConnectJob::DoSSLConnect() {
+   ssl_socket_ = client_socket_factory_->CreateSSLClientSocket(
+       transport_socket_handle_.Pass(),
+       params_->host_and_port(),
++      params_->network_cookie(),
+       params_->ssl_config(),
+       context_);
+   return ssl_socket_->Connect(callback_);
+diff --git a/net/socket/ssl_client_socket_pool.h b/net/socket/ssl_client_socket_pool.h
+index 2e4b20c..35ae7f3 100644
+--- a/net/socket/ssl_client_socket_pool.h
++++ b/net/socket/ssl_client_socket_pool.h
+@@ -51,6 +51,16 @@ class NET_EXPORT_PRIVATE SSLSocketParams
+                   int load_flags,
+                   bool expect_spdy);
+ 
++  SSLSocketParams(const scoped_refptr<TransportSocketParams>& direct_params,
++                  const scoped_refptr<SOCKSSocketParams>& socks_proxy_params,
++                  const scoped_refptr<HttpProxySocketParams>& http_proxy_params,
++                  const HostPortPair& host_and_port,
++		  const std::string& network_cookie,
++                  const SSLConfig& ssl_config,
++                  PrivacyMode privacy_mode,
++                  int load_flags,
++                  bool expect_spdy);
++
+   // Returns the type of the underlying connection.
+   ConnectionType GetConnectionType() const;
+ 
+@@ -67,6 +77,7 @@ class NET_EXPORT_PRIVATE SSLSocketParams
+       GetHttpProxyConnectionParams() const;
+ 
+   const HostPortPair& host_and_port() const { return host_and_port_; }
++  const std::string& network_cookie() const { return network_cookie_; }
+   const SSLConfig& ssl_config() const { return ssl_config_; }
+   PrivacyMode privacy_mode() const { return privacy_mode_; }
+   int load_flags() const { return load_flags_; }
+@@ -81,6 +92,7 @@ class NET_EXPORT_PRIVATE SSLSocketParams
+   const scoped_refptr<SOCKSSocketParams> socks_proxy_params_;
+   const scoped_refptr<HttpProxySocketParams> http_proxy_params_;
+   const HostPortPair host_and_port_;
++  const std::string network_cookie_;
+   const SSLConfig ssl_config_;
+   const PrivacyMode privacy_mode_;
+   const int load_flags_;
+-- 
+1.7.9.5
+
