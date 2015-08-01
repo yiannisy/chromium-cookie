@@ -4,7 +4,7 @@ This is a helper directory for Chromium build with network cookies support.
 You can skip build-from-source and download a cookie-enabled Chromium image.
 
 ## Build from source
-Follow the instructions to download, sync, and build.
+Follow the standard Chromium instructions to download, sync, and build. Then apply these patches and rebuild (use the shared_libraries flag for faster builds during development). 
 I feel that forking straight from chromium might break the multiple repos and
 build, so I just list the necessary patches here for cookie support instead of 
 maintaining my own branches.
@@ -23,6 +23,17 @@ maintaining my own branches.
 (Forked from boringssl at 209b2562235f7dab66b8260624e7b3c5b00d14a6
 
 ## Download cookie-enabled Chromium.
-A ready to use image is available here : http://anylink.stanford.edu
+
+### Ubuntu (tested with 12.04 and 14.04)
+[Download](http://anylink.stanford.edu)
 
 ## Try it
+
+(optionally) unzip and run!
+```
+tar xvfz cookie_chromium.tar.gz
+cd Release
+./chrome --disable-setuid-sandbox
+```
+
+
